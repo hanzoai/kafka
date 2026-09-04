@@ -20,16 +20,16 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-s -w" -o /hanzo-kafka .
 
-FROM alpine:3.20
+# One directory in an empty image: the static binary and the files it reads;
+# nothing else is present to run, so nothing else can be run.
+FROM alpine:3.22 AS root
+RUN apk add --no-cache ca-certificates tzdata
 
-LABEL org.opencontainers.image.source="https://github.com/hanzoai/kafka"
-LABEL org.opencontainers.image.description="Hanzo Kafka - Kafka-compatible streaming over NATS"
-LABEL org.opencontainers.image.licenses="MIT"
-
-RUN apk add --no-cache ca-certificates
+FROM scratch
+COPY --from=root /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=root /usr/share/zoneinfo /usr/share/zoneinfo
 COPY --from=builder /hanzo-kafka /usr/local/bin/hanzo-kafka
-
+USER 65532:65532
 EXPOSE 9092 9093
-
-ENTRYPOINT ["hanzo-kafka"]
+ENTRYPOINT ["/usr/local/bin/hanzo-kafka"]
 CMD ["--pubsub-url", "nats://pubsub:4222", "--host", "0.0.0.0"]
