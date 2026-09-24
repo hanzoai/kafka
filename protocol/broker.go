@@ -215,6 +215,25 @@ func NewBroker(config *types.Configuration) *Broker {
 	}
 }
 
+// retention resolves the configured partition limits: zero takes the default,
+// a negative value means no limit on that axis.
+func (b *Broker) retention() pubsub.Retention {
+	r := pubsub.Retention{MaxAge: b.Config.RetentionMaxAge, MaxBytes: b.Config.RetentionMaxBytes}
+	switch {
+	case r.MaxAge == 0:
+		r.MaxAge = types.DefaultRetentionMaxAge
+	case r.MaxAge < 0:
+		r.MaxAge = 0
+	}
+	switch {
+	case r.MaxBytes == 0:
+		r.MaxBytes = types.DefaultRetentionMaxBytes
+	case r.MaxBytes < 0:
+		r.MaxBytes = -1
+	}
+	return r
+}
+
 // Startup initializes the broker and blocks serving Kafka clients. It is the
 // standalone entrypoint (main.go): any startup failure is fatal.
 func (b *Broker) Startup() {
@@ -239,6 +258,18 @@ func (b *Broker) Serve() error {
 
 	if err = b.PubSub.EnsureOffsetBucket(); err != nil {
 		return fmt.Errorf("ensure offset bucket: %w", err)
+	}
+
+	// Partitions created before the broker bounded them grow for as long as
+	// the store lives. One that cannot be bounded still serves, so this logs
+	// rather than refusing to start.
+	r := b.retention()
+	n, err := b.PubSub.BoundTopicStreams(r)
+	if n > 0 {
+		log.Info("Bounded %d topic streams to max age %s, max bytes %d", n, r.MaxAge, r.MaxBytes)
+	}
+	if err != nil {
+		log.Error("Bound topic streams: %v", err)
 	}
 
 	b.StartAdmin()

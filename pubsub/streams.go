@@ -1,6 +1,7 @@
 package pubsub
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -36,8 +37,22 @@ func ParseStreamName(name string) (topic string, partition uint32, ok bool) {
 	return topic, partition, err == nil
 }
 
-// CreateTopicStreams creates N Hanzo Kafka streams for a topic (one per partition)
-func (c *Client) CreateTopicStreams(topic string, numPartitions uint32, replicas int, storage nats.StorageType) error {
+// Retention bounds a partition stream: JetStream drops the oldest messages
+// once they are older than MaxAge or the stream holds more than MaxBytes. A
+// zero MaxAge and a MaxBytes of -1 are JetStream's spelling of no limit.
+type Retention struct {
+	MaxAge   time.Duration
+	MaxBytes int64
+}
+
+// bounded reports whether r limits anything.
+func (r Retention) bounded() bool {
+	return r.MaxAge > 0 || r.MaxBytes > 0
+}
+
+// CreateTopicStreams creates N Hanzo Kafka streams for a topic (one per
+// partition), each bounded by r.
+func (c *Client) CreateTopicStreams(topic string, numPartitions uint32, replicas int, storage nats.StorageType, r Retention) error {
 	if replicas < 1 {
 		replicas = 1
 	}
@@ -47,6 +62,9 @@ func (c *Client) CreateTopicStreams(topic string, numPartitions uint32, replicas
 			Subjects: []string{SubjectName(topic, i)},
 			Replicas: replicas,
 			Storage:  storage,
+			MaxAge:   r.MaxAge,
+			MaxBytes: r.MaxBytes,
+			Discard:  nats.DiscardOld,
 		}
 		_, err := c.JS.AddStream(cfg)
 		if err != nil {
@@ -55,6 +73,43 @@ func (c *Client) CreateTopicStreams(topic string, numPartitions uint32, replicas
 		log.Info("Created stream %s", cfg.Name)
 	}
 	return nil
+}
+
+// BoundTopicStreams applies r to every partition stream that has no limit at
+// all — streams created before the broker bounded them, which otherwise grow
+// for as long as the store lives. A stream carrying any limit was set that way
+// on purpose and is left alone. It returns how many streams it bounded, and
+// keeps going past a stream it cannot update: that stream still serves, as
+// unbounded as before.
+func (c *Client) BoundTopicStreams(r Retention) (int, error) {
+	if !r.bounded() {
+		return 0, nil
+	}
+	var n int
+	var errs []error
+	for name := range c.JS.StreamNames() {
+		if _, _, ok := ParseStreamName(name); !ok {
+			continue
+		}
+		info, err := c.JS.StreamInfo(name)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+			continue
+		}
+		cfg := info.Config
+		if cfg.MaxAge > 0 || cfg.MaxBytes > 0 || cfg.MaxMsgs > 0 {
+			continue
+		}
+		cfg.MaxAge = r.MaxAge
+		cfg.MaxBytes = r.MaxBytes
+		cfg.Discard = nats.DiscardOld
+		if _, err := c.JS.UpdateStream(&cfg); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", name, err))
+			continue
+		}
+		n++
+	}
+	return n, errors.Join(errs...)
 }
 
 // TopicExists checks if at least partition 0 stream exists for this topic

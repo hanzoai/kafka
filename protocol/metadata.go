@@ -130,7 +130,7 @@ func (b *Broker) getMetadataResponse(req types.Request) []byte {
 			if replicas < 1 {
 				replicas = 1
 			}
-			b.PubSub.CreateTopicStreams(reqTopic.Name, 1, replicas, nats.FileStorage)
+			b.PubSub.CreateTopicStreams(reqTopic.Name, 1, replicas, nats.FileStorage, b.retention())
 			topic.Partitions = append(topic.Partitions, MetadataResponsePartition{
 				PartitionIndex: 0,
 				LeaderID:       nodeID,

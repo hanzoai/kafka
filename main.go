@@ -52,6 +52,8 @@ func main() {
 	rootCmd.Flags().IntVar(&config.NodeID, "node-id", 1, "Broker node ID")
 	rootCmd.Flags().IntVar(&config.StreamReplicas, "replicas", 1, "Hanzo Kafka replica count")
 	rootCmd.Flags().StringVar(&config.StorageType, "storage", "file", "Hanzo Kafka storage type: file or memory")
+	rootCmd.Flags().DurationVar(&config.RetentionMaxAge, "retention", types.DefaultRetentionMaxAge, "Partition max age (negative: no limit)")
+	rootCmd.Flags().Int64Var(&config.RetentionMaxBytes, "retention-bytes", types.DefaultRetentionMaxBytes, "Partition max bytes (negative: no limit)")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Panic("Failed to execute root command %v", err)

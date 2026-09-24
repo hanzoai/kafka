@@ -88,7 +88,7 @@ func (b *Broker) getCreateTopicResponse(req types.Request) []byte {
 			if replicas < 1 {
 				replicas = 1
 			}
-			err := b.PubSub.CreateTopicStreams(topic.Name, topic.NumPartitions, replicas, nats.FileStorage)
+			err := b.PubSub.CreateTopicStreams(topic.Name, topic.NumPartitions, replicas, nats.FileStorage, b.retention())
 			if err != nil {
 				log.Error("Error creating topic streams: %v", err)
 				topicResponse.ErrorCode = uint16(ErrUnknownServerError.Code)

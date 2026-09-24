@@ -17,7 +17,7 @@ Kafka Client → TCP :9092 → Hanzo Kafka (protocol translation) → Hanzo PubS
 | Produce | `Publish("kafka.foo.0", recordBatchBytes)` → seq = offset+1 |
 | Fetch at offset | `GetMsg(streamName, offset+1)` (PubSub 1-based, Kafka 0-based) |
 | Consumer group offsets | KV bucket `kafka-consumer-offsets`, key `{group}.{topic}.{partition}` |
-| Create topic (N parts) | N calls to `AddStream()` |
+| Create topic (N parts) | N calls to `AddStream()`, each bounded by the retention below |
 | Metadata | `StreamInfo()` per partition stream |
 
 ## Critical: Offset Model
@@ -40,6 +40,26 @@ deletes leave holes), so sequence arithmetic is meaningless.
   `kafka-consumer-offsets` (`group.topic.partition` keys) — the durable state;
   the gateway itself is stateless and restartable. Any non-negative int64 is a
   valid offset. OffsetFetch with a null topics array enumerates the bucket.
+
+## Retention
+Every partition stream carries `MaxAge` + `MaxBytes` with `Discard: old` —
+Kafka's delete policy. Defaults (`types.DefaultRetention*`): 7 days (Kafka's
+`log.retention.hours`) and 256 MiB per partition. Configure with
+`--retention` / `--retention-bytes` (cloud: `CLOUD_KAFKA_RETENTION`,
+`CLOUD_KAFKA_RETENTION_BYTES`); zero takes the default, negative lifts the
+limit on that axis.
+
+At boot the broker bounds every `kafka-*` stream that has no limit at all
+(`BoundTopicStreams`), so topics made before retention existed stop growing
+without a hand edit. A stream with any limit is left alone. A stream it cannot
+update is logged and still serves.
+
+The byte cap is small on purpose: JetStream reserves each stream's `MaxBytes`
+against the server's store limit (75% of the disk free at boot unless set)
+when the stream is created, and refuses a stream once the reservations would
+exceed it. On AWS the bus lives on the hanzo-data node's root disk (~57 GiB,
+EVENT already reserves 8 GiB), so 1 GiB per partition across ~22 topics would
+be refused.
 
 ## Tests
 `go test ./...` — `test/e2e` runs a REAL Kafka client (franz-go) against the

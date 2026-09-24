@@ -56,16 +56,20 @@ func newStack(t *testing.T) *stack {
 
 // startBroker (re)starts the Kafka adaptor over the same pubsub — the restart
 // tests use it to prove no broker-local state matters.
-func (s *stack) startBroker(t *testing.T) {
+func (s *stack) startBroker(t *testing.T, opts ...func(*types.Configuration)) {
 	t.Helper()
-	s.b = broker.NewBroker(&types.Configuration{
+	cfg := &types.Configuration{
 		PubSubUrl:      s.ps.ClientURL(),
 		BrokerHost:     "127.0.0.1",
 		BrokerPort:     0,
 		NodeID:         1,
 		StreamReplicas: 1,
 		StorageType:    "file",
-	})
+	}
+	for _, o := range opts {
+		o(cfg)
+	}
+	s.b = broker.NewBroker(cfg)
 	errc := make(chan error, 1)
 	go func() { errc <- s.b.Serve() }()
 	deadline := time.Now().Add(5 * time.Second)
@@ -86,7 +90,7 @@ func (s *stack) startBroker(t *testing.T) {
 
 func (s *stack) createTopic(t *testing.T, topic string) {
 	t.Helper()
-	if err := s.b.PubSub.CreateTopicStreams(topic, 1, 1, natsio.FileStorage); err != nil {
+	if err := s.b.PubSub.CreateTopicStreams(topic, 1, 1, natsio.FileStorage, defaultRetention); err != nil {
 		t.Fatalf("create topic: %v", err)
 	}
 }
