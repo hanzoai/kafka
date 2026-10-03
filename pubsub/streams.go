@@ -1,6 +1,7 @@
 package pubsub
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -161,27 +162,58 @@ type StoredMsg struct {
 // the primitive for reading a partition: Hanzo PubSub assigns sequences that
 // are only guaranteed monotonic, not dense (deletes leave holes and the
 // production store allocates from a sparse space), so "seq+1" addresses
-// nothing. An ephemeral by-start-sequence subscription asks the stream itself
-// for the next real message.
+// nothing. One message-get request with next_by_subj asks the store itself for
+// the next real message; the partition stream carries exactly one subject, so
+// filtering by it skips nothing. The JetStream context only sends
+// next_by_subj on the direct-get path, which these streams do not enable, so
+// the request is made here.
 func (c *Client) NextMessage(topic string, partition uint32, seq uint64) (*StoredMsg, error) {
 	if seq < 1 {
 		seq = 1
 	}
-	sub, err := c.JS.SubscribeSync(SubjectName(topic, partition),
-		nats.StartSequence(seq), nats.AckNone(), nats.MaxDeliver(1))
+	req, err := json.Marshal(msgGetRequest{Seq: seq, NextFor: SubjectName(topic, partition)})
 	if err != nil {
 		return nil, err
 	}
-	defer sub.Unsubscribe()
-	msg, err := sub.NextMsg(500 * time.Millisecond)
-	if err != nil {
-		return nil, nil // nothing at or past seq
-	}
-	meta, err := msg.Metadata()
+	reply, err := c.NC.Request(msgGetSubject+StreamName(topic, partition), req, apiTimeout)
 	if err != nil {
 		return nil, err
 	}
-	return &StoredMsg{Sequence: meta.Sequence.Stream, Data: msg.Data}, nil
+	var resp msgGetResponse
+	if err := json.Unmarshal(reply.Data, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		if errors.Is(resp.Error, nats.ErrMsgNotFound) {
+			return nil, nil // nothing at or past seq
+		}
+		return nil, resp.Error
+	}
+	if resp.Message == nil {
+		return nil, errors.New("message get: empty response")
+	}
+	return &StoredMsg{Sequence: resp.Message.Sequence, Data: resp.Message.Data}, nil
+}
+
+// msgGetSubject is the JetStream message-get API, suffixed by stream name.
+const msgGetSubject = "$JS.API.STREAM.MSG.GET."
+
+// apiTimeout matches the JetStream context's default API wait.
+const apiTimeout = 5 * time.Second
+
+// msgGetRequest asks for the first stored message at or after Seq whose
+// subject matches NextFor.
+type msgGetRequest struct {
+	Seq     uint64 `json:"seq"`
+	NextFor string `json:"next_by_subj"`
+}
+
+type msgGetResponse struct {
+	Message *struct {
+		Sequence uint64 `json:"seq"`
+		Data     []byte `json:"data"`
+	} `json:"message"`
+	Error *nats.APIError `json:"error"`
 }
 
 // ListTopics returns all unique topic names from kafka-* streams
