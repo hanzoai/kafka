@@ -157,6 +157,20 @@ type StoredMsg struct {
 	Data     []byte
 }
 
+// LastMessage returns the last message stored on a partition, or nil if it
+// holds none. It asks by subject: a stream's LastSeq keeps naming a message
+// that was deleted after it was stored.
+func (c *Client) LastMessage(topic string, partition uint32) (*StoredMsg, error) {
+	msg, err := c.JS.GetLastMsg(StreamName(topic, partition), SubjectName(topic, partition))
+	if errors.Is(err, nats.ErrMsgNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &StoredMsg{Sequence: msg.Sequence, Data: msg.Data}, nil
+}
+
 // NextMessage returns the first stored message with sequence >= seq, or nil if
 // the partition holds none at or past it. This — not sequence arithmetic — is
 // the primitive for reading a partition: Hanzo PubSub assigns sequences that

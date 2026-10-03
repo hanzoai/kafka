@@ -104,58 +104,62 @@ func (b *Broker) partitionBounds(topic string, partition uint32) (bounds, error)
 	}
 	st := info.State
 	bd := bounds{created: info.Created, firstSeq: st.FirstSeq, lastSeq: st.LastSeq, msgs: st.Msgs}
-	var exact bool
-	bd.logStart, bd.next, exact = b.readBounds(topic, partition, st)
-	if exact {
-		b.bounds.Store(key, bd)
+	if bd.logStart, bd.next, err = b.readBounds(topic, partition, st); err != nil {
+		return bounds{}, err
 	}
+	b.bounds.Store(key, bd)
 	return bd, nil
 }
 
-// readBounds reads the log bounds off a stream in state st. exact reports that
-// every read answered for st; a failed read, or a message gone since st was
-// taken, yields bounds that serve this call and are not kept.
-func (b *Broker) readBounds(topic string, partition uint32, st nats.StreamState) (logStart, next int64, exact bool) {
+// readBounds reads the log bounds off a stream in state st. A read that fails
+// is an error, never a guess: bounds the store did not answer for would send
+// consumers to reset and have produce stamp offsets that already exist. A
+// stream that changed after st was taken answers for its newer content, which
+// is what any caller holding st would read a moment later.
+func (b *Broker) readBounds(topic string, partition uint32, st nats.StreamState) (logStart, next int64, err error) {
 	if st.Msgs == 0 {
-		return 0, 0, true
+		return 0, 0, nil
 	}
-	exact = true
 
-	// Head: first valid record set at or after FirstSeq. FirstSeq is stored,
-	// so a partition that starts with a record set costs one addressed read.
+	// Head: first valid record set at or after FirstSeq.
 	var first int64
 	ok := false
-	if msg, err := b.PubSub.GetMessage(topic, partition, st.FirstSeq); err != nil {
-		exact = false
-	} else {
-		first, _, ok = batchSpan(msg.Data)
-	}
 	for seq, i := st.FirstSeq, 0; !ok && i < boundsScanLimit && seq <= st.LastSeq; i++ {
 		msg, err := b.PubSub.NextMessage(topic, partition, seq)
-		if err != nil || msg == nil {
-			exact = false
+		if err != nil {
+			return 0, 0, err
+		}
+		if msg == nil {
 			break
 		}
 		first, _, ok = batchSpan(msg.Data)
 		seq = msg.Sequence + 1
 	}
 	if !ok {
-		return 0, 0, exact // nothing but foreign messages: an empty log
+		return 0, 0, nil // nothing but foreign messages: an empty log
 	}
 
-	// Tail: the last stored message is addressable directly. If it is foreign,
-	// fall back to a bounded forward scan for the last valid record set.
-	if msg, err := b.PubSub.GetMessage(topic, partition, st.LastSeq); err != nil {
-		exact = false
-	} else if _, last, ok := batchSpan(msg.Data); ok {
-		return first, last + 1, exact
+	// Tail: the last stored message, asked for by subject, since LastSeq can
+	// name a message deleted after it was stored. If it is foreign, fall back
+	// to a bounded forward scan for the last valid record set.
+	tail, err := b.PubSub.LastMessage(topic, partition)
+	if err != nil {
+		return 0, 0, err
+	}
+	if tail == nil {
+		return 0, 0, nil
+	}
+	if _, last, ok := batchSpan(tail.Data); ok {
+		return first, last + 1, nil
 	}
 	log.Warn("partition %s/%d tail is not a record batch; scanning", topic, partition)
 	next = first
-	for seq, i := st.FirstSeq, 0; i < boundsScanLimit && seq <= st.LastSeq; i++ {
+	for seq, i := st.FirstSeq, 0; i < boundsScanLimit && seq <= tail.Sequence; i++ {
 		msg, err := b.PubSub.NextMessage(topic, partition, seq)
-		if err != nil || msg == nil {
-			exact = false
+		if err != nil {
+			return 0, 0, err
+		}
+		if msg == nil {
 			break
 		}
 		if _, last, ok := batchSpan(msg.Data); ok {
@@ -163,7 +167,7 @@ func (b *Broker) readBounds(topic string, partition uint32, st nats.StreamState)
 		}
 		seq = msg.Sequence + 1
 	}
-	return first, next, exact
+	return first, next, nil
 }
 
 // readHint remembers, per partition, where the last served fetch left off, so

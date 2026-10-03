@@ -23,8 +23,8 @@ func sameOps(got, want map[string]int) bool {
 
 // TestBoundsFollowStreamState holds the bounds cache to the stream: unchanged
 // state answers from the cache for exactly one StreamInfo, and every way the
-// state moves (publish, a foreign message at the tail, delete, purge,
-// publish after purge) is seen on the next read.
+// state moves (publish, a foreign message at the tail, deleting the head,
+// purge, publish after purge, deleting the tail) is seen on the next read.
 func TestBoundsFollowStreamState(t *testing.T) {
 	s := newStack(t)
 	const topic = "bounds"
@@ -86,6 +86,15 @@ func TestBoundsFollowStreamState(t *testing.T) {
 
 	produce(t, s.addr, topic, 0, 2)
 	want("publish after purge", 0, 2)
+
+	if info, err = s.js.StreamInfo(stream); err != nil {
+		t.Fatalf("stream info: %v", err)
+	}
+	if err := s.js.DeleteMsg(stream, info.State.LastSeq); err != nil {
+		t.Fatalf("delete tail: %v", err)
+	}
+	want("tail deleted", 0, 1)
+	cached("tail deleted, again", 0, 1)
 }
 
 // TestIdleFetchReadsNoMessage: a caught-up fetch costs one StreamInfo per
