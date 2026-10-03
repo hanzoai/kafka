@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/hanzoai/kafka/pubsub"
 	"github.com/hanzoai/kafka/types"
@@ -207,4 +209,50 @@ func cpuTime(tb testing.TB) time.Duration {
 		tb.Fatalf("getrusage: %v", err)
 	}
 	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+}
+
+// apiLog records the JetStream API requests the store receives, by operation
+// (STREAM.INFO, STREAM.MSG.GET, CONSUMER.CREATE, ...). It reads them off the
+// API subjects rather than the account's API counter, which leaves out
+// message gets.
+type apiLog struct {
+	nc  *nats.Conn
+	sub *nats.Subscription
+}
+
+func (s *stack) watchAPI(tb testing.TB) *apiLog {
+	tb.Helper()
+	sub, err := s.nc.SubscribeSync("$JS.API.>")
+	if err != nil {
+		tb.Fatalf("watch api: %v", err)
+	}
+	if err := sub.SetPendingLimits(-1, -1); err != nil {
+		tb.Fatalf("pending limits: %v", err)
+	}
+	return &apiLog{nc: s.nc, sub: sub}
+}
+
+// take returns the requests received since the last take. The store copies a
+// request to this subscription before it answers it, so after a flush every
+// request a finished call made has arrived.
+func (a *apiLog) take(tb testing.TB) map[string]int {
+	tb.Helper()
+	if err := a.nc.Flush(); err != nil {
+		tb.Fatalf("flush: %v", err)
+	}
+	ops := map[string]int{}
+	for {
+		m, err := a.sub.NextMsg(10 * time.Millisecond)
+		if err != nil {
+			return ops
+		}
+		var op []string
+		for _, tok := range strings.Split(strings.TrimPrefix(m.Subject, "$JS.API."), ".") {
+			if strings.IndexFunc(tok, func(r rune) bool { return !unicode.IsUpper(r) && r != '_' }) >= 0 {
+				break
+			}
+			op = append(op, tok)
+		}
+		ops[strings.Join(op, ".")]++
+	}
 }

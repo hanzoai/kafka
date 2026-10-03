@@ -216,6 +216,26 @@ type msgGetResponse struct {
 	Error *nats.APIError `json:"error"`
 }
 
+// tailPrefix prefixes the core subject a broker announces a partition's new
+// tail on once the store has acknowledged an append. It lies outside every
+// partition stream's subject, so no stream stores the announcement.
+const tailPrefix = "_kafka.tail."
+
+// AnnounceTail tells every broker on the bus that a partition's stream has a
+// new tail. The announcement carries no payload: a listener rereads the stream.
+func (c *Client) AnnounceTail(topic string, partition uint32) error {
+	return c.NC.Publish(tailPrefix+StreamName(topic, partition), nil)
+}
+
+// WatchTails calls fn with the stream name of every tail any broker on the bus
+// announces. fn runs on the subscription's goroutine and must not block.
+func (c *Client) WatchTails(fn func(stream string)) error {
+	_, err := c.NC.Subscribe(tailPrefix+">", func(m *nats.Msg) {
+		fn(strings.TrimPrefix(m.Subject, tailPrefix))
+	})
+	return err
+}
+
 // ListTopics returns all unique topic names from kafka-* streams
 func (c *Client) ListTopics() ([]string, error) {
 	topicSet := make(map[string]bool)

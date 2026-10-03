@@ -4,6 +4,7 @@ import (
 	"time"
 
 	log "github.com/hanzoai/kafka/logging"
+	"github.com/hanzoai/kafka/pubsub"
 	"github.com/hanzoai/kafka/serde"
 	"github.com/hanzoai/kafka/types"
 )
@@ -164,14 +165,75 @@ func decodeFetchRequest(d serde.Decoder, fetchRequest *FetchRequest, apiVersion 
 	}
 }
 
+// maxFetchWait caps how long a fetch is held for data. A client waits for the
+// response for at least the MaxWaitMs it sent, so answering earlier is always
+// valid; the cap bounds what a misconfigured or hostile client can pin.
+const maxFetchWait = 30 * time.Second
+
+// fetchWait is how long a fetch with nothing to return is held. MaxWaitMs is
+// an INT32 on the wire: zero or negative means answer at once.
+func fetchWait(maxWaitMs uint32) time.Duration {
+	ms := int32(maxWaitMs)
+	if ms <= 0 {
+		return 0
+	}
+	return min(time.Duration(ms)*time.Millisecond, maxFetchWait)
+}
+
+// getFetchResponse answers a Fetch the way Kafka's delayed fetch does: at once
+// when the partitions hold MinBytes of records, a partition holds more than
+// this response can carry, or any partition answers with an error; otherwise
+// once a requested partition gets a new tail that satisfies it or MaxWaitMs
+// runs out, whichever comes first. Reading an
+// unchanged partition costs one StreamInfo, on arrival and on each wake; a
+// parked fetch costs nothing while it waits.
 func (b *Broker) getFetchResponse(req types.Request) []byte {
+	start := time.Now()
 	decoder := serde.NewDecoder(req.Body)
 	fetchRequest := &FetchRequest{}
 	decodeFetchRequest(decoder, fetchRequest, req.RequestAPIVersion)
 	log.Debug("fetchRequest %+v", fetchRequest)
 
-	numTotalRecordBytes := 0
-	response := FetchResponse{}
+	minBytes := int(int32(fetchRequest.MinBytes))
+	deadline := start.Add(fetchWait(fetchRequest.MaxWaitMs))
+	var streams []string
+	for _, tp := range fetchRequest.Topics {
+		for _, p := range tp.Partitions {
+			streams = append(streams, pubsub.StreamName(tp.Name, p.PartitionIndex))
+		}
+	}
+	// Park before the first read: a tail announced while the partitions are
+	// being read is then held in wake rather than lost.
+	wake := make(chan struct{}, 1)
+	if time.Until(deadline) > 0 && len(streams) > 0 {
+		defer b.park(streams, wake)()
+	}
+
+	for {
+		response, size, now := b.fetchOnce(fetchRequest)
+		wait := time.Until(deadline)
+		if now || size >= minBytes || wait <= 0 || len(streams) == 0 {
+			return encodeFetchResponse(req, response)
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-wake:
+			timer.Stop()
+			continue
+		case <-timer.C:
+		case <-b.ShutDownSignal:
+			timer.Stop()
+		}
+		return encodeFetchResponse(req, response)
+	}
+}
+
+// fetchOnce reads every requested partition as the store holds it now. It
+// returns the response, the record bytes in it, and whether to answer
+// without waiting for MinBytes: a partition answered with an error, or a
+// partition holds records past the one record set a fetch serves it, so
+// waiting cannot make this response any fuller.
+func (b *Broker) fetchOnce(fetchRequest *FetchRequest) (response FetchResponse, size int, now bool) {
 	for _, tp := range fetchRequest.Topics {
 		fetchTopicResponse := FetchTopicResponse{TopicName: tp.Name}
 		for _, p := range tp.Partitions {
@@ -179,40 +241,40 @@ func (b *Broker) getFetchResponse(req types.Request) []byte {
 				PartitionIndex:       p.PartitionIndex,
 				PreferredReadReplica: uint32(MinusOne), // -1 = no preferred replica
 			}
-			logStart, hw, err := b.partitionBounds(tp.Name, p.PartitionIndex)
+			bd, err := b.partitionBounds(tp.Name, p.PartitionIndex)
 			if err != nil {
 				pr.ErrorCode = uint16(ErrUnknownTopicOrPartition.Code)
 			} else {
-				pr.HighWatermark = uint64(hw)
-				pr.LastStableOffset = uint64(hw)
-				pr.LogStartOffset = uint64(logStart)
+				pr.HighWatermark = uint64(bd.next)
+				pr.LastStableOffset = uint64(bd.next)
+				pr.LogStartOffset = uint64(bd.logStart)
 				offset := int64(p.FetchOffset)
 				switch {
-				case offset < logStart || offset > hw:
+				case offset < bd.logStart || offset > bd.next:
 					// Out of range is an answer, not a stall: the client resets
 					// per its auto.offset.reset policy. Serving empty here
 					// instead (the old behavior) left consumers polling a dead
 					// position forever whenever their committed offset stopped
 					// existing (purge, retention, an operator reset).
 					pr.ErrorCode = uint16(ErrOffsetOutOfRange.Code)
-				case offset == hw:
+				case offset == bd.next:
 					// caught up: empty records, no error
 				default:
-					if msg := b.findRecordSet(tp.Name, p.PartitionIndex, offset); msg != nil {
+					if msg := b.findRecordSet(tp.Name, p.PartitionIndex, offset, bd); msg != nil {
 						pr.Records = msg.Data
-						numTotalRecordBytes += len(msg.Data)
+						size += len(msg.Data)
+						if _, last, ok := batchSpan(msg.Data); ok && last+1 < bd.next {
+							now = true
+						}
 					}
 				}
 			}
+			now = now || pr.ErrorCode != 0
 			fetchTopicResponse.Partitions = append(fetchTopicResponse.Partitions, pr)
 		}
 		response.Responses = append(response.Responses, fetchTopicResponse)
 	}
-	if numTotalRecordBytes == 0 {
-		log.Debug("No data available for this fetch, waiting briefly")
-		time.Sleep(300 * time.Millisecond)
-	}
-	return encodeFetchResponse(req, response)
+	return response, size, now
 }
 
 // encodeFetchResponse manually encodes the Fetch response based on API version.

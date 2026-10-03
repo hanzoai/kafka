@@ -614,13 +614,13 @@ func (b *Broker) getListOffsetsResponse(req types.Request) []byte {
 		topic := ListOffsetsResponseTopic{Name: t.Name}
 		for _, p := range t.Partitions {
 			partition := ListOffsetsResponsePartition{PartitionIndex: p.PartitionIndex, LeaderEpoch: uint32(MinusOne)}
-			logStart, hw, err := b.partitionBounds(t.Name, p.PartitionIndex)
+			bd, err := b.partitionBounds(t.Name, p.PartitionIndex)
 			if err != nil {
 				partition.ErrorCode = uint16(ErrUnknownTopicOrPartition.Code)
 			} else if p.Timestamp == uint64(ListOffsetsEarliestTimestamp) {
-				partition.Offset = uint64(logStart)
+				partition.Offset = uint64(bd.logStart)
 			} else if p.Timestamp == uint64(ListOffsetsLatestTimestamp) {
-				partition.Offset = uint64(hw)
+				partition.Offset = uint64(bd.next)
 			} else {
 				log.Error("ListOffsetsMaxTimestamp not implemented")
 			}

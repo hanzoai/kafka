@@ -122,7 +122,8 @@ func (b *Broker) getProduceResponse(req types.Request) []byte {
 			} else {
 				mu := b.partitionLock(td.Name, pd.Index)
 				mu.Lock()
-				_, nextOffset, offsetErr := b.partitionBounds(td.Name, pd.Index)
+				bd, offsetErr := b.partitionBounds(td.Name, pd.Index)
+				nextOffset := bd.next
 				if offsetErr != nil {
 					mu.Unlock()
 					log.Error("Error computing next offset: %v", offsetErr)
@@ -144,6 +145,12 @@ func (b *Broker) getProduceResponse(req types.Request) []byte {
 					} else {
 						partitionResponse.BaseOffset = uint64(nextOffset)
 						partitionResponse.LogAppendTimeMs = utils.NowAsUnixMilli()
+						// Fetches parked on this partition, on any broker, wake
+						// to read the append. A lost announcement costs them
+						// only their remaining MaxWaitMs.
+						if err := b.PubSub.AnnounceTail(td.Name, pd.Index); err != nil {
+							log.Warn("announce tail %s/%d: %v", td.Name, pd.Index, err)
+						}
 					}
 				}
 			}

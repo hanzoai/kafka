@@ -12,6 +12,7 @@ import (
 	"github.com/hanzoai/kafka/pubsub"
 	"github.com/hanzoai/kafka/serde"
 	"github.com/hanzoai/kafka/types"
+	"github.com/nats-io/nats.go"
 )
 
 // maxRequestSize bounds a single Kafka request frame (128 MiB).
@@ -31,7 +32,13 @@ type Broker struct {
 	listener     net.Listener
 	partitionMu  sync.Map // map[string]*sync.Mutex keyed by "topic-partition"
 	readHints    sync.Map // map[string]readHint keyed by "topic-partition"
+	bounds       sync.Map // map[string]bounds keyed by partition stream name
 	shutdownOnce sync.Once
+
+	// waiters holds, per partition stream, the wake channel of every fetch
+	// parked on it until data arrives or its wait runs out.
+	waitMu  sync.Mutex
+	waiters map[string]map[chan struct{}]struct{}
 }
 
 // partitionLock returns a mutex for a topic+partition, ensuring safe concurrent offset assignment.
@@ -57,49 +64,98 @@ func (b *Broker) partitionLock(topic string, partition uint32) *sync.Mutex {
 // the broker.
 const boundsScanLimit = 10000
 
+// bounds are a partition's Kafka log bounds together with the stream state
+// they were read from. Stored messages never change and sequences never
+// repeat within a stream, so the bounds hold for as long as the stream reports
+// the same state: the same stream (Created) with the same first and last
+// sequence and message count. Publish, purge, delete and retention each move
+// at least one of those.
+type bounds struct {
+	created  time.Time
+	firstSeq uint64
+	lastSeq  uint64
+	msgs     uint64
+	logStart int64 // first offset of the first valid record set
+	next     int64 // one past the last offset of the last valid record set
+}
+
+// of reports whether bd was read from the state info reports.
+func (bd bounds) of(info *nats.StreamInfo) bool {
+	st := info.State
+	return bd.created.Equal(info.Created) && bd.firstSeq == st.FirstSeq &&
+		bd.lastSeq == st.LastSeq && bd.msgs == st.Msgs
+}
+
 // partitionBounds derives the Kafka log bounds: logStart is the first offset
 // of the first valid record set, next is one past the last offset of the last
-// valid one (the high watermark, and the offset produce stamps next).
-func (b *Broker) partitionBounds(topic string, partition uint32) (logStart, next int64, err error) {
+// valid one (the high watermark, and the offset produce stamps next). It costs
+// one StreamInfo; the stored messages are read only when the stream's state
+// differs from the one the cached bounds were read from.
+func (b *Broker) partitionBounds(topic string, partition uint32) (bounds, error) {
 	info, err := b.PubSub.GetStreamInfo(topic, partition)
 	if err != nil {
-		return 0, 0, err
+		return bounds{}, err
 	}
-	if info.State.Msgs == 0 {
-		return 0, 0, nil
+	key := pubsub.StreamName(topic, partition)
+	if v, ok := b.bounds.Load(key); ok {
+		if bd := v.(bounds); bd.of(info) {
+			return bd, nil
+		}
 	}
+	st := info.State
+	bd := bounds{created: info.Created, firstSeq: st.FirstSeq, lastSeq: st.LastSeq, msgs: st.Msgs}
+	var exact bool
+	bd.logStart, bd.next, exact = b.readBounds(topic, partition, st)
+	if exact {
+		b.bounds.Store(key, bd)
+	}
+	return bd, nil
+}
 
-	// Head: first valid record set at or after FirstSeq.
-	seq := info.State.FirstSeq
-	var first *int64
-	for i := 0; i < boundsScanLimit; i++ {
+// readBounds reads the log bounds off a stream in state st. exact reports that
+// every read answered for st; a failed read, or a message gone since st was
+// taken, yields bounds that serve this call and are not kept.
+func (b *Broker) readBounds(topic string, partition uint32, st nats.StreamState) (logStart, next int64, exact bool) {
+	if st.Msgs == 0 {
+		return 0, 0, true
+	}
+	exact = true
+
+	// Head: first valid record set at or after FirstSeq. FirstSeq is stored,
+	// so a partition that starts with a record set costs one addressed read.
+	var first int64
+	ok := false
+	if msg, err := b.PubSub.GetMessage(topic, partition, st.FirstSeq); err != nil {
+		exact = false
+	} else {
+		first, _, ok = batchSpan(msg.Data)
+	}
+	for seq, i := st.FirstSeq, 0; !ok && i < boundsScanLimit && seq <= st.LastSeq; i++ {
 		msg, err := b.PubSub.NextMessage(topic, partition, seq)
 		if err != nil || msg == nil {
+			exact = false
 			break
 		}
-		if f, _, ok := batchSpan(msg.Data); ok {
-			first = &f
-			break
-		}
+		first, _, ok = batchSpan(msg.Data)
 		seq = msg.Sequence + 1
 	}
-	if first == nil {
-		return 0, 0, nil // nothing but foreign messages: an empty log
+	if !ok {
+		return 0, 0, exact // nothing but foreign messages: an empty log
 	}
 
 	// Tail: the last stored message is addressable directly. If it is foreign,
 	// fall back to a bounded forward scan for the last valid record set.
-	if msg, err := b.PubSub.GetMessage(topic, partition, info.State.LastSeq); err == nil {
-		if _, last, ok := batchSpan(msg.Data); ok {
-			return *first, last + 1, nil
-		}
+	if msg, err := b.PubSub.GetMessage(topic, partition, st.LastSeq); err != nil {
+		exact = false
+	} else if _, last, ok := batchSpan(msg.Data); ok {
+		return first, last + 1, exact
 	}
 	log.Warn("partition %s/%d tail is not a record batch; scanning", topic, partition)
-	next = *first
-	seq = info.State.FirstSeq
-	for i := 0; i < boundsScanLimit; i++ {
+	next = first
+	for seq, i := st.FirstSeq, 0; i < boundsScanLimit && seq <= st.LastSeq; i++ {
 		msg, err := b.PubSub.NextMessage(topic, partition, seq)
 		if err != nil || msg == nil {
+			exact = false
 			break
 		}
 		if _, last, ok := batchSpan(msg.Data); ok {
@@ -107,7 +163,7 @@ func (b *Broker) partitionBounds(topic string, partition uint32) (logStart, next
 		}
 		seq = msg.Sequence + 1
 	}
-	return *first, next, nil
+	return first, next, exact
 }
 
 // readHint remembers, per partition, where the last served fetch left off, so
@@ -120,13 +176,13 @@ type readHint struct {
 
 // findRecordSet returns the stored record set whose span contains offset, or
 // the first valid one past it (sequence holes and skipped foreign messages
-// leave gaps in the offset space). Returns nil when nothing at or past offset
-// exists. Callers have already bounds-checked offset, so nil means the data
-// the bounds promised could not be read — serve empty and let the client
-// retry, never serve bytes that did not walk.
-func (b *Broker) findRecordSet(topic string, partition uint32, offset int64) *pubsub.StoredMsg {
-	info, err := b.PubSub.GetStreamInfo(topic, partition)
-	if err != nil || info.State.Msgs == 0 {
+// leave gaps in the offset space), searching the sequence range bd was read
+// from. Returns nil when nothing at or past offset exists. Callers have
+// already bounds-checked offset against bd, so nil means the data the bounds
+// promised could not be read — serve empty and let the client retry, never
+// serve bytes that did not walk.
+func (b *Broker) findRecordSet(topic string, partition uint32, offset int64, bd bounds) *pubsub.StoredMsg {
+	if bd.msgs == 0 {
 		return nil
 	}
 
@@ -144,7 +200,7 @@ func (b *Broker) findRecordSet(topic string, partition uint32, offset int64) *pu
 	// Binary search over the sequence space. A probe at mid returns the first
 	// stored valid record set at or after mid together with its real sequence,
 	// so sparse sequences and holes still halve the interval each round.
-	lo, hi := info.State.FirstSeq, info.State.LastSeq
+	lo, hi := bd.firstSeq, bd.lastSeq
 	for lo <= hi {
 		mid := lo + (hi-lo)/2
 		msg := b.probeFrom(topic, partition, mid, 0)
@@ -212,7 +268,46 @@ func NewBroker(config *types.Configuration) *Broker {
 	return &Broker{
 		Config:         config,
 		ShutDownSignal: make(chan bool),
+		waiters:        make(map[string]map[chan struct{}]struct{}),
 	}
+}
+
+// park registers wake to be signalled when any of streams gets a new tail,
+// and returns the call that removes it again.
+func (b *Broker) park(streams []string, wake chan struct{}) (unpark func()) {
+	b.waitMu.Lock()
+	for _, s := range streams {
+		set := b.waiters[s]
+		if set == nil {
+			set = make(map[chan struct{}]struct{})
+			b.waiters[s] = set
+		}
+		set[wake] = struct{}{}
+	}
+	b.waitMu.Unlock()
+	return func() {
+		b.waitMu.Lock()
+		for _, s := range streams {
+			delete(b.waiters[s], wake)
+			if len(b.waiters[s]) == 0 {
+				delete(b.waiters, s)
+			}
+		}
+		b.waitMu.Unlock()
+	}
+}
+
+// wake signals every fetch parked on stream. A wake channel holds one signal,
+// so one that fires while its fetch is still reading is not lost.
+func (b *Broker) wake(stream string) {
+	b.waitMu.Lock()
+	for ch := range b.waiters[stream] {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	b.waitMu.Unlock()
 }
 
 // retention resolves the configured partition limits: zero takes the default,
@@ -258,6 +353,13 @@ func (b *Broker) Serve() error {
 
 	if err = b.PubSub.EnsureOffsetBucket(); err != nil {
 		return fmt.Errorf("ensure offset bucket: %w", err)
+	}
+
+	// A fetch with nothing to read parks until a partition it asked for gets a
+	// new tail. Every broker on the bus announces its appends, so a fetch
+	// served here wakes for a produce served by any of them.
+	if err = b.PubSub.WatchTails(b.wake); err != nil {
+		return fmt.Errorf("watch partition tails: %w", err)
 	}
 
 	// Partitions created before the broker bounded them grow for as long as
