@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -347,7 +348,31 @@ func (b *Broker) Startup() {
 // in-process. It stores the listener so Shutdown can stop it; a clean Shutdown
 // closes ShutDownSignal + the listener, so Accept fails and Serve returns nil.
 // Run it in a goroutine when embedding.
+//
+// It is Connect, a TCP listener on Config.BrokerPort, and Accept on it.
 func (b *Broker) Serve() error {
+	if err := b.Connect(); err != nil {
+		return err
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", b.Config.BrokerPort))
+	if err != nil {
+		return fmt.Errorf("listen :%d: %w", b.Config.BrokerPort, err)
+	}
+	// Port 0 asked the kernel to pick: settle the real port BEFORE publishing
+	// the listener, so a caller that can see the listener can also see the port
+	// Metadata and FindCoordinator will advertise.
+	if b.Config.BrokerPort == 0 {
+		b.Config.BrokerPort = ln.Addr().(*net.TCPAddr).Port
+	}
+	return b.Accept(ln)
+}
+
+// Connect is the half of Serve that reaches the bus: it dials PubSub, makes
+// sure the offset bucket exists, watches partition tails, bounds the partitions
+// it finds, and starts the admin server. It returns as soon as the bus answers,
+// so a host that owns the Kafka listener itself can fail its start on an
+// unreachable bus without waiting on a timer, then call Accept.
+func (b *Broker) Connect() error {
 	var err error
 
 	b.PubSub, err = pubsub.NewClient(b.Config.PubSubUrl)
@@ -379,22 +404,34 @@ func (b *Broker) Serve() error {
 	}
 
 	b.StartAdmin()
+	return nil
+}
 
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", b.Config.BrokerPort))
-	if err != nil {
-		return fmt.Errorf("listen :%d: %w", b.Config.BrokerPort, err)
-	}
-	// Port 0 asked the kernel to pick: settle the real port BEFORE publishing
-	// the listener, so a caller that can see the listener can also see the port
-	// Metadata and FindCoordinator will advertise.
-	if b.Config.BrokerPort == 0 {
-		b.Config.BrokerPort = ln.Addr().(*net.TCPAddr).Port
-	}
+// Accept serves Kafka clients from ln until Shutdown, which closes ln and makes
+// Accept return nil. Call it after Connect.
+//
+// The address Metadata and FindCoordinator advertise is Config.BrokerHost and
+// Config.BrokerPort, never ln's own: a host can own the TCP port clients dial
+// and hand the broker a unix socket behind it, and clients must be told the
+// port they can reach.
+//
+// A listener closed by anything other than Shutdown can never accept again, so
+// Accept returns that error rather than retrying a dead socket.
+func (b *Broker) Accept(ln net.Listener) error {
 	b.listenerMu.Lock()
 	b.listener = ln
 	b.listenerMu.Unlock()
+	// A Shutdown that ran before the listener was published found nothing to
+	// close; closing it here keeps Accept from blocking past it.
+	select {
+	case <-b.ShutDownSignal:
+		ln.Close()
+		return nil
+	default:
+	}
 
-	log.Info("Hanzo Kafka listening on port %d (PubSub: %s)", b.Config.BrokerPort, b.Config.PubSubUrl)
+	log.Info("Hanzo Kafka listening on %s, advertising %s:%d (PubSub: %s)",
+		ln.Addr(), b.Config.BrokerHost, b.Config.BrokerPort, b.Config.PubSubUrl)
 
 	for {
 		conn, err := ln.Accept()
@@ -403,9 +440,12 @@ func (b *Broker) Serve() error {
 			case <-b.ShutDownSignal:
 				return nil
 			default:
-				log.Error("Error accepting connection: %v", err)
-				continue
 			}
+			if errors.Is(err, net.ErrClosed) {
+				return fmt.Errorf("accept on %s: %w", ln.Addr(), err)
+			}
+			log.Error("Error accepting connection: %v", err)
+			continue
 		}
 		go b.HandleConnection(conn)
 	}
