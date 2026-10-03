@@ -138,8 +138,7 @@ func decodeFetchRequest(d serde.Decoder, fetchRequest *FetchRequest, apiVersion 
 					p.CurrentLeaderEpoch = d.UInt32()
 				}
 				p.FetchOffset = d.UInt64()
-				if apiVersion >= 12 {
-					p.LastFetchedEpoch = d.UInt32()
+				if apiVersion >= 5 {
 					p.LogStartOffset = d.UInt64()
 				}
 				p.PartitionMaxBytes = d.UInt32()
