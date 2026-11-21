@@ -2,6 +2,8 @@
 
 # Hanzo Kafka
 
+[![Open in Hanzo](https://hanzo.app/badges/open-in-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/kafka&ref=main&action=open) [![Edit with Hanzo](https://hanzo.app/badges/edit-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/kafka&ref=main&action=edit) [![Deploy with Hanzo](https://hanzo.app/badges/deploy-with-hanzo.svg)](https://hanzo.app/dev/open?repo=github.com/hanzoai/kafka&ref=main&action=deploy)
+
 Kafka wire protocol adapter for Hanzo PubSub (NATS JetStream). Accepts standard Kafka clients and translates requests to NATS underneath, allowing any Kafka producer/consumer to work against Hanzo infrastructure without code changes.
 
 ## Features
